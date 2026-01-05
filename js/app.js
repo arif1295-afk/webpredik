@@ -526,6 +526,7 @@ let firebaseDb = null;
 
 const mcGridEl = document.getElementById('mcGrid');
 const nextEstimateEl = document.getElementById('nextEstimate');
+const adviceBtn = document.getElementById('adviceBtn');
 
 function loadScript(url){
   return new Promise((resolve,reject)=>{
@@ -581,6 +582,44 @@ async function fetchHistoricalMean(limit = 200){
     const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
     return mean;
   }catch(e){ console.warn('fetchHistoricalMean failed', e); return null; }
+}
+
+// fetch last prediction records
+async function fetchLastPredictions(limit = 100){
+  if(!firebaseDb) return [];
+  try{
+    const snap = await firebaseDb.ref('predictions').orderByChild('timestamp').limitToLast(limit).once('value');
+    const out = [];
+    snap.forEach(child => { const v = child.val(); if(v) out.push(v); });
+    return out.reverse(); // return newest first
+  }catch(e){ console.warn('fetchLastPredictions failed', e); return []; }
+}
+
+// Advice: compute average historical MC accuracy and optionally return suggestion
+async function handleAdviceRequest(){
+  try{
+    await ensurePredictionLibs();
+    if(!firebaseDb){ analysisResultsEl.innerHTML = '<b>Minta Saran:</b> Firebase tidak dikonfigurasi.'; return; }
+    const recs = await fetchLastPredictions(200);
+    if(!recs.length){ analysisResultsEl.innerHTML = '<b>Minta Saran:</b> Tidak ada data historis.'; return; }
+    // compute mean of mc.avgAccuracy
+    const accs = recs.map(r=> r.mc && typeof r.mc.avgAccuracy === 'number' ? r.mc.avgAccuracy : null).filter(x=>x!==null);
+    const meanAcc = accs.length ? accs.reduce((a,b)=>a+b,0)/accs.length : 0;
+    const meanAccRounded = Math.round(meanAcc*100)/100;
+    if(meanAcc >= 99){
+      // if very high historical accuracy, produce suggestion using latest record
+      const latest = recs[0];
+      const suggestion = latest.position || (latest.mc && latest.mc.suggested) || 'Neutral';
+      const detail = latest.position ? `score ${latest.position.score}` : '';
+      analysisResultsEl.innerHTML = `<b>Saran (berdasarkan history ${meanAccRounded}%):</b> ${suggestion} ${detail}`;
+      // also render its blended sample if available
+      if(latest.blendedNextsSample && latest.blendedNextsSample.length){
+        renderMCGrid(latest.blendedNextsSample.concat(new Array(100-latest.blendedNextsSample.length).fill(null)), latest.finalEstimate || null);
+      }
+    }else{
+      analysisResultsEl.innerHTML = `<b>Saran tidak diberikan</b> — rata-rata akurasi historis ${meanAccRounded}%, butuh >=99%`;
+    }
+  }catch(e){ console.warn('handleAdviceRequest failed', e); analysisResultsEl.innerHTML = `<b>Saran gagal:</b> ${e.message||e}`; }
 }
 
 function renderMCGrid(preds, lastPrice){
@@ -665,7 +704,7 @@ if(predToggleBtn){
             const finalEstimate = (histMean ? (mc.mean * 0.6 + histMean * 0.4) : mc.mean);
             if(nextEstimateEl) nextEstimateEl.textContent = `Perkiraan berikutnya: $${(Math.round(finalEstimate*100)/100).toLocaleString()}`;
             // render grid of MC small boxes
-            try{ renderMCGrid(blendedNexts); }catch(e){ console.warn('renderMCGrid failed', e); }
+            try{ renderMCGrid(blendedNexts, lastPrice); }catch(e){ console.warn('renderMCGrid failed', e); }
 
             // build labels for recent + future
             const recentSlice = data.prices.slice(-predictSteps);
@@ -737,6 +776,14 @@ if(predToggleBtn){
       }
     }
   });
+  // advice button handler
+  if(adviceBtn){
+    adviceBtn.addEventListener('click', async ()=>{
+      if(adviceBtn) adviceBtn.disabled = true;
+      await handleAdviceRequest();
+      if(adviceBtn) adviceBtn.disabled = false;
+    });
+  }
 }
 
 // Train a tiny TF.js model to predict next price from last N prices
