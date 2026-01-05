@@ -698,21 +698,21 @@ function renderMCGrid(preds, lastPrice){
   while(show.length < BOX_COUNT) show.push(null);
   show.forEach((v,i)=>{
     const d = document.createElement('div');
-    d.style.width = '72px'; d.style.height = '42px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
-    d.style.fontSize='12px'; d.style.border='1px solid #333'; d.style.borderRadius='6px';
-    d.style.color = '#f8f8f2'; d.style.padding = '4px';
+    d.style.width = '140px'; d.style.height = '84px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
+    d.style.fontSize='14px'; d.style.border='1px solid #333'; d.style.borderRadius='8px';
+    d.style.color = '#f8f8f2'; d.style.padding = '8px';
     // if v is an object with advice/prediction details, render that
     if(v && typeof v === 'object'){
       d.style.background = v.color || (typeof v.percent === 'number' && v.percent >= 60 ? '#064' : (typeof v.percent === 'number' && v.percent <= 40 ? '#640' : '#333'));
-      const top = document.createElement('div'); top.style.fontSize='12px'; top.style.fontWeight='700'; top.textContent = v.pred !== undefined ? `${v.pred}` : (v.text || '—');
+      const top = document.createElement('div'); top.style.fontSize='16px'; top.style.fontWeight='700'; top.textContent = v.pred !== undefined ? `${v.pred}` : (v.text || '—');
       d.appendChild(top);
       // TP / SL lines
       if(typeof v.tp !== 'undefined' || typeof v.sl !== 'undefined'){
-        const tp = document.createElement('div'); tp.style.fontSize='10px'; tp.style.opacity='0.9'; tp.textContent = `TP: ${typeof v.tp==='number'? ('$'+(Math.round(v.tp*100)/100)) : '—'}`;
-        const sl = document.createElement('div'); sl.style.fontSize='10px'; sl.style.opacity='0.9'; sl.textContent = `SL: ${typeof v.sl==='number'? ('$'+(Math.round(v.sl*100)/100)) : '—'}`;
+        const tp = document.createElement('div'); tp.style.fontSize='13px'; tp.style.opacity='0.95'; tp.style.fontWeight='600'; tp.textContent = `TP: ${typeof v.tp==='number'? ('$'+(Math.round(v.tp*100)/100)) : '—'}`;
+        const sl = document.createElement('div'); sl.style.fontSize='13px'; sl.style.opacity='0.95'; sl.style.fontWeight='600'; sl.textContent = `SL: ${typeof v.sl==='number'? ('$'+(Math.round(v.sl*100)/100)) : '—'}`;
         d.appendChild(tp); d.appendChild(sl);
       } else {
-        const p = document.createElement('div'); p.style.fontSize='11px'; p.style.opacity = '0.95'; p.textContent = (typeof v.percent === 'number') ? `${v.percent}%` : '—';
+        const p = document.createElement('div'); p.style.fontSize='13px'; p.style.opacity = '0.95'; p.textContent = (typeof v.percent === 'number') ? `${v.percent}%` : '—';
         d.appendChild(p);
       }
     }else{
