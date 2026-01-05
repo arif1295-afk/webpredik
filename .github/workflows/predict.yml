@@ -1,0 +1,28 @@
+name: Scheduled ML Predict
+
+on:
+  # Scheduled automatic prediction disabled to avoid background runs.
+  # Use manual dispatch to run predictions when desired.
+  workflow_dispatch:
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          cd functions
+          npm ci
+
+      - name: Run prediction
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: node functions/scripts/predict.js

@@ -1,0 +1,37 @@
+*{box-sizing:border-box;font-family:Segoe UI, Roboto, Arial, sans-serif}
+body{margin:0;background:#f5f7fb;color:#0b1220;padding:24px}
+main{max-width:980px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 6px 24px rgba(12,18,30,0.06)}
+h1{margin-top:0}
+.main-relative{position:relative}
+.controls{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+#note{color:#555;margin-bottom:8px}
+/* Fixed canvas size so chart stays the same regardless of viewport */
+canvas{width:600px;height:250px;display:block;margin:0 auto}
+button{padding:8px 12px;border-radius:6px;border:1px solid #cbd5e1;background:#1f6feb;color:#fff;cursor:pointer}
+button:active{transform:translateY(1px)}
+select{padding:6px;border-radius:6px;border:1px solid #cbd5e1}
+@media (max-width:640px){canvas{width:600px;height:250px}}
+
+h2{font-size:16px;margin:16px 0 8px}
+#predChart{display:block;margin:0 auto 12px}
+
+/* Price box in the top-right */
+#priceBox{
+	position:absolute;
+	top:12px;
+	right:12px;
+	background:#0b1220;
+	color:#fff;
+	padding:6px 10px;
+	border-radius:6px;
+	font-weight:600;
+	font-size:14px;
+	box-shadow:0 6px 18px rgba(2,6,23,0.12);
+}
+
+/* Price state colors */
+#priceBox.up{ background: #08321a; color: #a6f4c5; }
+#priceBox.down{ background: #3b0f0f; color: #ffd6d6; }
+#priceBox.unchanged{ background: #0b1220; color: #fff; }
+
+#priceBox .delta{ font-weight:500; font-size:12px; margin-left:8px; opacity:0.9 }
