@@ -669,7 +669,7 @@ async function clearFirebasePredictions(){
 // Prediction toggle button behavior
 if(predToggleBtn){
   const PRED_COUNTDOWN_SECONDS = 10; // countdown before running heavy prediction
-  const MC_TRIALS = 100; // default Monte Carlo trials (reduced for responsiveness)
+  const MC_TRIALS = 10; // run 10 Monte Carlo trials as requested
   let predCountdownTimer = null;
   let predCountdownRemaining = 0;
 
@@ -689,6 +689,13 @@ if(predToggleBtn){
 
       try{
         console.log('Starting Monte Carlo with trials=', MC_TRIALS);
+        // Prefill grid with current price while MC runs
+        try{
+          const priceStr = `$${(Math.round(lastPrice*100)/100).toLocaleString()}`;
+          const prefill = Array.from({length:100}, ()=>({ text: priceStr, percent: null }));
+          renderMCGrid(prefill, lastPrice);
+        }catch(e){ console.warn('Prefill MC grid failed', e); }
+
         const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, MC_TRIALS);
         console.log('MC result', mc);
         let fund = null;
@@ -751,14 +758,60 @@ if(predToggleBtn){
         // compute position signal and TP/SL
         const pos = computePositionSignal(mc, fund, lastPrice);
 
-        // show TP/SL suggestions and blended info with numeric score
-        analysisResultsEl.innerHTML = `<b>Rekomendasi:</b> ${pos.position} (score ${pos.score}) — Confidence up ${mc && mc.percentUp? mc.percentUp : '—'}% — avg acc ${mc && mc.avgAccuracy? mc.avgAccuracy : '—'}%<br><b>TP:</b> ${pos.tp? '$'+pos.tp.toFixed(2) : '—'} <b>SL:</b> ${pos.sl? '$'+pos.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
+        // Build trial outcomes for the first N trials (MC_TRIALS)
+        const trialsUsed = (mc && Array.isArray(mc.nextPreds)) ? Math.min(mc.nextPreds.length, MC_TRIALS) : 0;
+        let profitCount = 0; let lossCount = 0;
+        const perTrialOutcomes = [];
+        for(let i=0;i<trialsUsed;i++){
+          const p = mc.nextPreds[i];
+          let outcome = 'neutral';
+          if(pos && pos.position === 'Long'){
+            if(p > lastPrice) { outcome = 'profit'; profitCount++; }
+            else if(p < lastPrice) { outcome = 'loss'; lossCount++; }
+          }else if(pos && pos.position === 'Short'){
+            if(p < lastPrice) { outcome = 'profit'; profitCount++; }
+            else if(p > lastPrice) { outcome = 'loss'; lossCount++; }
+          }else{
+            // neutral: treat small moves as neutral
+            if(Math.abs(p - lastPrice) / lastPrice > 0.001){ if(p > lastPrice){ profitCount++; outcome='profit'; } else { lossCount++; outcome='loss'; } }
+          }
+          perTrialOutcomes.push({pred:p, outcome});
+        }
+
+        // Base percent from avgAccuracy or percentUp
+        let basePercent = (mc && typeof mc.avgAccuracy === 'number') ? Math.round(mc.avgAccuracy) : ((mc && typeof mc.percentUp === 'number')? Math.round(mc.percentUp) : 50);
+        const adjustedPercent = Math.min(100, Math.max(0, basePercent + profitCount - lossCount));
+
+        // Build advice items: first `trialsUsed` show predictions + adjusted percent; rest are placeholders
+        const adviceItems = [];
+        for(let i=0;i<100;i++){
+          if(i < trialsUsed){
+            const t = perTrialOutcomes[i];
+            const label = `${pos.position || 'Neutral' } ${t.outcome==='profit'? '↑' : (t.outcome==='loss'? '↓' : '–')}`;
+            adviceItems.push({ text: label, percent: adjustedPercent, color: (adjustedPercent>=60? '#064' : (adjustedPercent<=40? '#640' : '#333')) });
+          }else{
+            adviceItems.push(null);
+          }
+        }
+        try{ renderMCGrid(adviceItems, lastPrice); }catch(e){ console.warn('renderMCGrid advice render failed', e); }
+
+        // show TP/SL suggestions and blended info with numeric score (kept hidden if UI prefers)
+        try{ analysisResultsEl.innerHTML = `<b>Rekomendasi:</b> ${pos.position} (score ${pos.score}) — Confidence up ${mc && mc.percentUp? mc.percentUp : '—'}% — avg acc ${mc && mc.avgAccuracy? mc.avgAccuracy : '—'}%<br><b>TP:</b> ${pos.tp? '$'+pos.tp.toFixed(2) : '—'} <b>SL:</b> ${pos.sl? '$'+pos.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`; }catch(e){}
 
         if(firebaseDb){
           try{
-            const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund, position: pos, histMean: histMean, finalEstimate: finalEstimate, blendedNextsSample: blendedNexts.slice(0, Math.min(20, blendedNexts.length)) };
+            const rec = {
+              timestamp:(new Date()).toISOString(), lookback, predictSteps,
+              lastPrice, tp: pos.tp, sl: pos.sl,
+              mc, blend, fundamentals: fund, position: pos,
+              trialsUsed, perTrialOutcomes, basePercent, adjustedPercent
+            };
             await firebaseDb.ref('predictions').push(rec);
-          }catch(e){ console.warn('Failed to save MC preds', e); }
+            console.error('Prediction saved (summary):', rec);
+          }catch(e){ console.error('Failed to save MC preds', e); }
+        }else{
+          // still log summary to console for debugging
+          console.error('Prediction summary (no firebase):', { lastPrice, tp: pos.tp, sl: pos.sl, trialsUsed, profitCount, lossCount, basePercent, adjustedPercent });
         }
 
       }catch(e){ console.warn('Monte Carlo prediction failed', e); analysisResultsEl.innerHTML = `<b>Prediksi gagal:</b> ${e.message || e}`; }
