@@ -527,6 +527,8 @@ let firebaseDb = null;
 const mcGridEl = document.getElementById('mcGrid');
 const nextEstimateEl = document.getElementById('nextEstimate');
 const adviceBtn = document.getElementById('adviceBtn');
+// number of advice boxes to show
+const BOX_COUNT = 10;
 
 function loadScript(url){
   return new Promise((resolve,reject)=>{
@@ -613,8 +615,8 @@ async function handleAdviceRequest(){
       const detail = latest.position ? `score ${latest.position.score}` : '';
       analysisResultsEl.innerHTML = `<b>Saran (berdasarkan history ${meanAccRounded}%):</b> ${suggestion} ${detail}`;
       // also render its blended sample if available
-      if(latest.blendedNextsSample && latest.blendedNextsSample.length){
-        renderMCGrid(latest.blendedNextsSample.concat(new Array(100-latest.blendedNextsSample.length).fill(null)), latest.finalEstimate || null);
+        if(latest.blendedNextsSample && latest.blendedNextsSample.length){
+        renderMCGrid(latest.blendedNextsSample.concat(new Array(BOX_COUNT-latest.blendedNextsSample.length).fill(null)), latest.finalEstimate || null);
       }
     }else{
       analysisResultsEl.innerHTML = `<b>Saran tidak diberikan</b> — rata-rata akurasi historis ${meanAccRounded}%, butuh >=99%`;
@@ -625,9 +627,9 @@ async function handleAdviceRequest(){
 function renderMCGrid(preds, lastPrice){
   if(!mcGridEl) return;
   mcGridEl.innerHTML = '';
-  // ensure we display exactly 100 boxes: pad with nulls if needed
-  const show = Array.isArray(preds) ? preds.slice(0,100) : [];
-  while(show.length < 100) show.push(null);
+  // ensure we display exactly BOX_COUNT boxes: pad with nulls if needed
+  const show = Array.isArray(preds) ? preds.slice(0,BOX_COUNT) : [];
+  while(show.length < BOX_COUNT) show.push(null);
   show.forEach((v,i)=>{
     const d = document.createElement('div');
     d.style.width = '72px'; d.style.height = '42px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
@@ -692,7 +694,7 @@ if(predToggleBtn){
         // Prefill grid with current price while MC runs
         try{
           const priceStr = `$${(Math.round(lastPrice*100)/100).toLocaleString()}`;
-          const prefill = Array.from({length:100}, ()=>({ text: priceStr, percent: null }));
+          const prefill = Array.from({length:BOX_COUNT}, ()=>({ text: priceStr, percent: null }));
           renderMCGrid(prefill, lastPrice);
         }catch(e){ console.warn('Prefill MC grid failed', e); }
 
@@ -732,7 +734,7 @@ if(predToggleBtn){
           blendedNexts = adjustedNext.map(p => (histMean ? (p * 0.6 + histMean * 0.4) : p));
           finalEstimate = base;
           if(nextEstimateEl) nextEstimateEl.textContent = `Perkiraan berikutnya (fallback): $${(Math.round(base*100)/100).toLocaleString()}`;
-          if(firebaseDb){ try{ const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc: mc||null, fallbackBase: base, fundamentals: fund }; await firebaseDb.ref('predictions').push(rec); }catch(e){console.warn('Failed to save fallback rec', e);} }
+          if(firebaseDb){ try{ const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc: mc||null, fallbackBase: base, fundamentals: fund }; const newRef = firebaseDb.ref('predictions').push(); await newRef.set(rec); }catch(e){console.warn('Failed to save fallback rec', e);} }
         }
 
         // render grid of MC small boxes
@@ -784,7 +786,7 @@ if(predToggleBtn){
 
         // Build advice items: first `trialsUsed` show predictions + adjusted percent; rest are placeholders
         const adviceItems = [];
-        for(let i=0;i<100;i++){
+        for(let i=0;i<BOX_COUNT;i++){
           if(i < trialsUsed){
             const t = perTrialOutcomes[i];
             const label = `${pos.position || 'Neutral' } ${t.outcome==='profit'? '↑' : (t.outcome==='loss'? '↓' : '–')}`;
@@ -806,17 +808,94 @@ if(predToggleBtn){
               mc, blend, fundamentals: fund, position: pos,
               trialsUsed, perTrialOutcomes, basePercent, adjustedPercent
             };
-            await firebaseDb.ref('predictions').push(rec);
+            const newRef = firebaseDb.ref('predictions').push();
+            await newRef.set(rec);
             console.error('Prediction saved (summary):', rec);
+            // start monitoring session for TP/SL
+            startSessionMonitor(newRef.key, pos.tp, pos.sl, pos.position);
           }catch(e){ console.error('Failed to save MC preds', e); }
         }else{
-          // still log summary to console for debugging
+          // still log summary to console for debugging and start monitor locally
           console.error('Prediction summary (no firebase):', { lastPrice, tp: pos.tp, sl: pos.sl, trialsUsed, profitCount, lossCount, basePercent, adjustedPercent });
+          startSessionMonitor(null, pos.tp, pos.sl, pos.position);
         }
 
       }catch(e){ console.warn('Monte Carlo prediction failed', e); analysisResultsEl.innerHTML = `<b>Prediksi gagal:</b> ${e.message || e}`; }
 
     }catch(e){ console.warn('Failed to trigger load for prediction', e); }
+  }
+
+  // Session monitor state
+  let sessionActive = false;
+  let sessionIntervalId = null;
+
+  // Helper: fetch latest price (returns number or null)
+  async function getLatestPrice(){
+    try{
+      const url = `${BASE}/simple/price?ids=${ASSET_ID}&vs_currencies=usd`;
+      const headers = BASE === PRO_BASE && API_KEY ? { 'x-cg-pro-api-key': API_KEY } : {};
+      const res = await fetch(url, { headers, cache: 'no-store' });
+      if(!res.ok) return null;
+      const j = await res.json();
+      const price = j && j[ASSET_ID] && j[ASSET_ID].usd;
+      if(typeof price === 'number'){
+        if(priceBox) priceBox.textContent = `$${(Math.round(price*100)/100).toLocaleString()}`;
+        return price;
+      }
+      return null;
+    }catch(e){ console.warn('getLatestPrice failed', e); return null; }
+  }
+
+  // Start monitoring session until TP or SL touched; sessionKey optional (firebase)
+  function startSessionMonitor(sessionKey, tp, sl, position){
+    try{
+      if(sessionActive) return;
+      sessionActive = true;
+      const startTs = Date.now();
+      const updateUiOutcome = (outcome, finalPrice, durationSec)=>{
+        // color boxes to indicate final outcome
+        const items = [];
+        for(let i=0;i<BOX_COUNT;i++){
+          items.push({ text: outcome === 'TP' ? 'TP' : (outcome === 'SL' ? 'SL' : 'END'), percent: outcome === 'TP' ? 100 : (outcome === 'SL' ? 0 : 50), color: outcome === 'TP' ? '#064' : (outcome === 'SL' ? '#640' : '#333') });
+        }
+        try{ renderMCGrid(items, finalPrice); }catch(e){}
+        if(predCountdownEl) predCountdownEl.textContent = `Sesi selesai: ${outcome} (${durationSec}s)`;
+        try{ analysisResultsEl.style.display = 'block'; analysisResultsEl.innerHTML = `<b>Hasil Sesi:</b> ${outcome} — Durasi ${durationSec}s — Harga akhir $${(Math.round(finalPrice*100)/100).toLocaleString()}`; }catch(e){}
+      };
+
+      sessionIntervalId = setInterval(async ()=>{
+        try{
+          const p = await getLatestPrice();
+          if(typeof p !== 'number') return;
+          // check TP/SL
+          let outcome = null;
+          if(position === 'Long'){
+            if(typeof tp === 'number' && p >= tp) outcome = 'TP';
+            else if(typeof sl === 'number' && p <= sl) outcome = 'SL';
+          }else if(position === 'Short'){
+            if(typeof tp === 'number' && p <= tp) outcome = 'TP';
+            else if(typeof sl === 'number' && p >= sl) outcome = 'SL';
+          }
+          // update countdown elapsed display
+          const elapsed = Math.floor((Date.now() - startTs)/1000);
+          if(predCountdownEl) predCountdownEl.textContent = `Sesi berjalan: ${elapsed}s`;
+          if(outcome){
+            clearInterval(sessionIntervalId); sessionIntervalId = null; sessionActive = false;
+            const durationSec = Math.floor((Date.now() - startTs)/1000);
+            updateUiOutcome(outcome, p, durationSec);
+            // persist result to firebase if available
+            if(firebaseDb && sessionKey){
+              try{
+                await firebaseDb.ref(`predictions/${sessionKey}`).update({ result: outcome, endTime: (new Date()).toISOString(), durationSec, finalPrice: p });
+                console.error('Session result saved to Firebase', sessionKey, outcome, durationSec);
+              }catch(e){ console.error('Failed to save session result', e); }
+            }else{
+              console.error('Session ended (no firebase):', { outcome, durationSec, finalPrice: p });
+            }
+          }
+        }catch(err){ console.error('Session monitor error', err); }
+      }, 3000);
+    }catch(e){ console.error('Failed to startSessionMonitor', e); }
   }
 
   predToggleBtn.textContent = 'Prediksi: Off';
@@ -1044,10 +1123,10 @@ startPricePoll();
 // Attach analysis button handlers (manual only)
 // tech/fund buttons removed; analysis now runs inside prediction toggle
 
-// Initialize MC grid with 100 placeholders so layout is stable before predictions
+// Initialize MC grid with BOX_COUNT placeholders so layout is stable before predictions
 try{
   if(mcGridEl){
-    const placeholders = new Array(100).fill(null);
+    const placeholders = new Array(BOX_COUNT).fill(null);
     renderMCGrid(placeholders, null);
   }
   if(nextEstimateEl) nextEstimateEl.textContent = 'Perkiraan berikutnya: —';
