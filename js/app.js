@@ -583,16 +583,24 @@ async function fetchHistoricalMean(limit = 200){
   }catch(e){ console.warn('fetchHistoricalMean failed', e); return null; }
 }
 
-function renderMCGrid(preds){
+function renderMCGrid(preds, lastPrice){
   if(!mcGridEl) return;
   mcGridEl.innerHTML = '';
-  // ensure we display up to 100 boxes
+  // ensure we display exactly 100 boxes: pad with nulls if needed
   const show = preds.slice(0,100);
+  while(show.length < 100) show.push(null);
   show.forEach((v,i)=>{
     const d = document.createElement('div');
     d.style.width = '56px'; d.style.height = '28px'; d.style.display='flex'; d.style.alignItems='center'; d.style.justifyContent='center';
-    d.style.fontSize='11px'; d.style.background='#0b1220'; d.style.color='#f8f8f2'; d.style.border='1px solid #333'; d.style.borderRadius='4px';
-    d.textContent = (typeof v === 'number') ? Math.round(v*100)/100 : '—';
+    d.style.fontSize='11px'; d.style.border='1px solid #333'; d.style.borderRadius='4px';
+    d.style.color = '#f8f8f2';
+    // color by whether predicted value is above/below lastPrice
+    if(typeof v === 'number' && typeof lastPrice === 'number'){
+      if(v > lastPrice) { d.style.background = '#063'; } else if(v < lastPrice) { d.style.background = '#630'; } else { d.style.background = '#333'; }
+      d.textContent = Math.round(v*100)/100;
+    }else{
+      d.style.background = '#111'; d.style.opacity = 0.5; d.textContent = '—';
+    }
     mcGridEl.appendChild(d);
   });
 }
