@@ -737,8 +737,19 @@ if(predToggleBtn){
           if(firebaseDb){ try{ const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc: mc||null, fallbackBase: base, fundamentals: fund }; const newRef = firebaseDb.ref('predictions').push(); await newRef.set(rec); }catch(e){console.warn('Failed to save fallback rec', e);} }
         }
 
-        // render grid of MC small boxes
-        try{ renderMCGrid(blendedNexts, lastPrice); }catch(e){ console.warn('renderMCGrid failed', e); }
+        // If MC didn't run (no tf), synthesize a lightweight mc object from fallback so boxes get filled
+        if(!mc || !Array.isArray(mc.nextPreds) || !mc.nextPreds.length){
+          mc = mc || {};
+          mc.nextPreds = blendedNexts.slice(0, BOX_COUNT);
+          mc.mean = finalEstimate;
+          // compute percentUp conservatively
+          mc.percentUp = mc.nextPreds.filter(p=>p>lastPrice).length / Math.max(1, mc.nextPreds.length) * 100;
+          mc.avgAccuracy = null;
+          console.warn('Using synthesized MC results (fallback)');
+        }
+
+        // render grid of MC small boxes (blended predictions)
+        try{ renderMCGrid(mc.nextPreds.slice(0,BOX_COUNT).map(p=>({ text: Math.round(p*100)/100, percent: null })), lastPrice); }catch(e){ console.warn('renderMCGrid failed', e); }
 
         // build labels for recent + future
         const recentSlice = data.prices.slice(-predictSteps);
