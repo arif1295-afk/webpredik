@@ -66,7 +66,12 @@ async function fetchMarketChart(days = 30){
     const data = JSON.parse(text);
     return data;
   }catch(err){
-    noteEl.textContent = `Gagal mengambil data: ${err.message}`;
+    // suppress noisy network errors like 'Failed to fetch' during continuous polling
+    if(!/failed to fetch/i.test(err.message || '')){
+      noteEl.textContent = `Gagal mengambil data: ${err.message}`;
+    } else {
+      console.warn('fetchMarketChart network error suppressed:', err.message);
+    }
     throw err;
   }
 }
@@ -320,6 +325,37 @@ function fundamentalBlendScore(fund){
   let mult = changeScore * volScore * rankScore;
   mult = Math.max(0.8, Math.min(1.2, mult));
   return mult;
+}
+
+// Compute a numeric position signal and TP/SL suggestions using MC results + fundamentals
+function computePositionSignal(mc, fund, lastPrice){
+  // mc.percentUp is percentage 0..100, mc.avgAccuracy is percent
+  const upProb = (mc && typeof mc.percentUp === 'number') ? (mc.percentUp/100) : 0.5;
+  const acc = (mc && typeof mc.avgAccuracy === 'number') ? (mc.avgAccuracy/100) : 0.5;
+  const blend = fundamentalBlendScore(fund || null) || 1.0;
+
+  // score in range -1..1 (positive favors Buy)
+  let score = (upProb - 0.5) * 2; // -1..1
+  score = score * acc * blend;
+
+  // determine position
+  let position = 'Neutral';
+  if(score > 0.12) position = 'Buy';
+  else if(score < -0.12) position = 'Sell';
+
+  // TP/SL using MC median and std if available
+  const median = (mc && typeof mc.median === 'number') ? mc.median : lastPrice;
+  const std = (mc && typeof mc.std === 'number') ? mc.std : Math.abs(lastPrice*0.01);
+  let tp=null, sl=null;
+  if(position === 'Buy'){
+    tp = median + std * 1.5;
+    sl = lastPrice - std * 1.5;
+  }else if(position === 'Sell'){
+    tp = median - std * 1.5;
+    sl = lastPrice + std * 1.5;
+  }
+
+  return { position, score: Math.round(score*1000)/1000, tp, sl };
 }
 
 function renderChart(labels, values){
@@ -594,12 +630,16 @@ if(predToggleBtn){
             // render combined chart on lower panel
             renderPredictionChart(combinedLabels, actualSeries, predictedSeries);
 
-            // show TP/SL suggestions and blended info
-            analysisResultsEl.innerHTML = `<b>Sinyal:</b> ${mc.suggested} — Confidence up ${mc.percentUp}% — avg acc ${mc.avgAccuracy}%<br><b>TP:</b> ${mc.tp? '$'+mc.tp.toFixed(2) : '—'} <b>SL:</b> ${mc.sl? '$'+mc.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
+            // compute position signal and TP/SL
+            const lastPrice = data.prices[data.prices.length-1][1];
+            const pos = computePositionSignal(mc, fund, lastPrice);
+
+            // show TP/SL suggestions and blended info with numeric score
+            analysisResultsEl.innerHTML = `<b>Rekomendasi:</b> ${pos.position} (score ${pos.score}) — Confidence up ${mc.percentUp}% — avg acc ${mc.avgAccuracy}%<br><b>TP:</b> ${pos.tp? '$'+pos.tp.toFixed(2) : '—'} <b>SL:</b> ${pos.sl? '$'+pos.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
 
             if(firebaseDb){
               try{
-                const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund };
+                const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund, position: pos };
                 await firebaseDb.ref('predictions').push(rec);
               }catch(e){ console.warn('Failed to save MC preds', e); }
             }
@@ -630,10 +670,9 @@ if(predToggleBtn){
       // disabling: cancel countdown or running predictions and clear UI
       if(predCountdownTimer){ clearInterval(predCountdownTimer); predCountdownTimer = null; if(predCountdownEl) predCountdownEl.textContent = ''; }
       if(!SILENT_FETCH) noteEl.textContent = 'Menghentikan prediksi...';
+      // Do NOT delete historical prediction data; keep it for future learning
       if(firebaseDb){
-        if(!SILENT_FETCH) noteEl.textContent = 'Menghapus data prediksi di Firebase...';
-        const ok = await clearFirebasePredictions();
-        if(!SILENT_FETCH) noteEl.textContent = ok ? 'Semua data prediksi di Firebase telah dihapus.' : 'Gagal menghapus data prediksi di Firebase.';
+        if(!SILENT_FETCH) noteEl.textContent = 'Prediksi dihentikan. Data prediksi disimpan untuk pembelajaran.';
       }else{
         if(!SILENT_FETCH) noteEl.textContent = 'Prediksi dihentikan (Firebase tidak dikonfigurasi).';
       }
