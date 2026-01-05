@@ -680,6 +680,7 @@ let firebaseDb = null;
 const mcGridEl = document.getElementById('mcGrid');
 const nextEstimateEl = document.getElementById('nextEstimate');
 const adviceBtn = document.getElementById('adviceBtn');
+const mcSummaryEl = document.getElementById('mcSummaryBox');
 // number of advice boxes to show
 const BOX_COUNT = 10;
 let lastMarketData = null;
@@ -853,11 +854,16 @@ if(predToggleBtn){
 
       try{
         console.log('Starting Monte Carlo with trials=', MC_TRIALS);
-        // Prefill grid with current price while MC runs
+        // Prefill grid with provisional predictions and TP/SL while MC runs
         try{
-          const priceStr = `$${(Math.round(lastPrice*100)/100).toLocaleString()}`;
-          const prefill = Array.from({length:BOX_COUNT}, ()=>({ text: priceStr, percent: null }));
+          const prefill = Array.from({length:BOX_COUNT}, (_,i)=>{
+            const p = lastPrice * (1 + (Math.random()-0.5)*0.02);
+            const tp = p;
+            const sl = p > lastPrice ? Math.max(0, lastPrice - (p - lastPrice)) : lastPrice + (lastPrice - p);
+            return { start: lastPrice, pred: Math.round(p*100)/100, tp, sl, status: '' };
+          });
           renderMCGrid(prefill, lastPrice);
+          if(mcSummaryEl) mcSummaryEl.textContent = `Confidence: —% — Benar: 0 — Salah: 0`;
         }catch(e){ console.warn('Prefill MC grid failed', e); }
 
         const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, MC_TRIALS);
@@ -984,6 +990,11 @@ if(predToggleBtn){
           }
         }
         try{ renderMCGrid(adviceItems, lastPrice); }catch(e){ console.warn('renderMCGrid advice render failed', e); }
+
+        // update summary box with confidence and counts
+        try{
+          if(mcSummaryEl) mcSummaryEl.textContent = `Confidence: ${adjustedPercent}% — Benar: ${profitCount} — Salah: ${lossCount}`;
+        }catch(e){ console.warn('mcSummary update failed', e); }
 
         // Immediately show a simple status per box (berhasil/gagal) based on whether predicted > start price,
         // then refresh those boxes again so they cycle.
