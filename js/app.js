@@ -686,59 +686,89 @@ if(predToggleBtn){
     try{
       await ensurePredictionLibs();
       const data = await loadAndRender(rangeSelect.value);
-      if(data && window.tf && Array.isArray(data.prices) && data.prices.length){
-        const lookback = 8;
-        const predictSteps = Math.min(12, Math.max(3, Math.floor(data.prices.length / 6)));
-            if(!SILENT_FETCH) noteEl.textContent = 'Menjalankan prediksi berulang (ini mungkin butuh waktu)...';
-        try{
-          const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, MC_TRIALS);
-            if(mc){
-            if(!SILENT_FETCH) noteEl.textContent = `Hasil MC: trials=${mc.trials} — arah up ${mc.percentUp}% — akurasi rata-rata ${mc.avgAccuracy}% — sinyal: ${mc.suggested}`;
-            const fund = await fetchFundamentals();
-            const blend = fundamentalBlendScore(fund);
-            const adjustedNext = mc.nextPreds.map(p=>p * blend);
-            // incorporate historical mean from Firebase to bias predictions
-            let histMean = null;
-            try{ histMean = await fetchHistoricalMean(200); }catch(e){ console.warn('histMean fetch err', e); }
-            const blendedNexts = adjustedNext.map(p => (histMean ? (p * 0.6 + histMean * 0.4) : p));
-            const finalEstimate = (histMean ? (mc.mean * 0.6 + histMean * 0.4) : mc.mean);
-            if(nextEstimateEl) nextEstimateEl.textContent = `Perkiraan berikutnya: $${(Math.round(finalEstimate*100)/100).toLocaleString()}`;
-            // render grid of MC small boxes
-            try{ renderMCGrid(blendedNexts, lastPrice); }catch(e){ console.warn('renderMCGrid failed', e); }
+      if(!(data && window.tf && Array.isArray(data.prices) && data.prices.length)) return;
 
-            // build labels for recent + future
-            const recentSlice = data.prices.slice(-predictSteps);
-            const recentLabels = recentSlice.map(p=>msToLabel(p[0]));
-            const recentActuals = recentSlice.map(p=>p[1]);
-            const lastTs = data.prices[data.prices.length-1][0];
-            const prevTs = data.prices[data.prices.length-2][0];
-            const step = lastTs - prevTs || 86400000;
-            const predLabels = [];
-            for(let i=1;i<=predictSteps;i++) predLabels.push(msToLabel(lastTs + step * i));
+      const lastPrice = data.prices[data.prices.length-1][1];
+      const lookback = 8;
+      const predictSteps = Math.min(12, Math.max(3, Math.floor(data.prices.length / 6)));
+      if(!SILENT_FETCH) noteEl.textContent = 'Menjalankan prediksi berulang (ini mungkin butuh waktu)...';
 
-            const combinedLabels = recentLabels.concat(predLabels);
-            const actualSeries = recentActuals.concat(new Array(predictSteps).fill(null));
-            const predictedSeries = new Array(recentActuals.length).fill(null).concat(adjustedNext.map(v=>Math.round(v*100)/100));
+      try{
+        console.log('Starting Monte Carlo with trials=', MC_TRIALS);
+        const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, MC_TRIALS);
+        console.log('MC result', mc);
+        let fund = null;
+        let blend = 1.0;
+        let adjustedNext = [];
+        let blendedNexts = [];
+        let histMean = null;
+        let finalEstimate = null;
 
-            // render combined chart on lower panel
-            renderPredictionChart(combinedLabels, actualSeries, predictedSeries);
-
-            // compute position signal and TP/SL
-            const lastPrice = data.prices[data.prices.length-1][1];
-            const pos = computePositionSignal(mc, fund, lastPrice);
-
-            // show TP/SL suggestions and blended info with numeric score
-            analysisResultsEl.innerHTML = `<b>Rekomendasi:</b> ${pos.position} (score ${pos.score}) — Confidence up ${mc.percentUp}% — avg acc ${mc.avgAccuracy}%<br><b>TP:</b> ${pos.tp? '$'+pos.tp.toFixed(2) : '—'} <b>SL:</b> ${pos.sl? '$'+pos.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
-
-            if(firebaseDb){
-              try{
-                const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund, position: pos, histMean: histMean, finalEstimate: finalEstimate, blendedNextsSample: blendedNexts.slice(0, Math.min(20, blendedNexts.length)) };
-                await firebaseDb.ref('predictions').push(rec);
-              }catch(e){ console.warn('Failed to save MC preds', e); }
-            }
+        if(mc && Array.isArray(mc.nextPreds) && mc.nextPreds.length){
+          if(!SILENT_FETCH) noteEl.textContent = `Hasil MC: trials=${mc.trials} — arah up ${mc.percentUp}% — akurasi rata-rata ${mc.avgAccuracy}% — sinyal: ${mc.suggested}`;
+          fund = await fetchFundamentals();
+          blend = fundamentalBlendScore(fund);
+          adjustedNext = mc.nextPreds.map(p=>p * blend);
+          try{ histMean = await fetchHistoricalMean(200); }catch(e){ console.warn('histMean fetch err', e); }
+          blendedNexts = adjustedNext.map(p => (histMean ? (p * 0.6 + histMean * 0.4) : p));
+          finalEstimate = (histMean ? (mc.mean * 0.6 + histMean * 0.4) : mc.mean);
+          if(nextEstimateEl) nextEstimateEl.textContent = `Perkiraan berikutnya: $${(Math.round(finalEstimate*100)/100).toLocaleString()}`;
+        }else{
+          // fallback
+          console.warn('MC produced no nextPreds, using fallback trainAndPredict');
+          const fallback = await trainAndPredict(data.prices, lookback, predictSteps);
+          let base = null;
+          if(fallback && Array.isArray(fallback.preds) && fallback.preds.length){
+            base = fallback.preds[0];
+          } else if(mc && typeof mc.mean === 'number'){
+            base = mc.mean;
+          } else {
+            base = lastPrice;
           }
-        }catch(e){ console.warn('Monte Carlo prediction failed', e); analysisResultsEl.innerHTML = `<b>Prediksi gagal:</b> ${e.message || e}`; }
-      }
+          adjustedNext = Array.from({length:predictSteps}, (_,i)=> base * (1 + (Math.random()-0.5)*0.02));
+          try{ fund = await fetchFundamentals(); blend = fundamentalBlendScore(fund); }catch(e){}
+          try{ histMean = await fetchHistoricalMean(200); }catch(e){}
+          blendedNexts = adjustedNext.map(p => (histMean ? (p * 0.6 + histMean * 0.4) : p));
+          finalEstimate = base;
+          if(nextEstimateEl) nextEstimateEl.textContent = `Perkiraan berikutnya (fallback): $${(Math.round(base*100)/100).toLocaleString()}`;
+          if(firebaseDb){ try{ const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc: mc||null, fallbackBase: base, fundamentals: fund }; await firebaseDb.ref('predictions').push(rec); }catch(e){console.warn('Failed to save fallback rec', e);} }
+        }
+
+        // render grid of MC small boxes
+        try{ renderMCGrid(blendedNexts, lastPrice); }catch(e){ console.warn('renderMCGrid failed', e); }
+
+        // build labels for recent + future
+        const recentSlice = data.prices.slice(-predictSteps);
+        const recentLabels = recentSlice.map(p=>msToLabel(p[0]));
+        const recentActuals = recentSlice.map(p=>p[1]);
+        const lastTs = data.prices[data.prices.length-1][0];
+        const prevTs = data.prices[data.prices.length-2][0];
+        const step = lastTs - prevTs || 86400000;
+        const predLabels = [];
+        for(let i=1;i<=predictSteps;i++) predLabels.push(msToLabel(lastTs + step * i));
+
+        const combinedLabels = recentLabels.concat(predLabels);
+        const actualSeries = recentActuals.concat(new Array(predictSteps).fill(null));
+        const predictedSeries = new Array(recentActuals.length).fill(null).concat(adjustedNext.map(v=>Math.round(v*100)/100));
+
+        // render combined chart on lower panel
+        renderPredictionChart(combinedLabels, actualSeries, predictedSeries);
+
+        // compute position signal and TP/SL
+        const pos = computePositionSignal(mc, fund, lastPrice);
+
+        // show TP/SL suggestions and blended info with numeric score
+        analysisResultsEl.innerHTML = `<b>Rekomendasi:</b> ${pos.position} (score ${pos.score}) — Confidence up ${mc && mc.percentUp? mc.percentUp : '—'}% — avg acc ${mc && mc.avgAccuracy? mc.avgAccuracy : '—'}%<br><b>TP:</b> ${pos.tp? '$'+pos.tp.toFixed(2) : '—'} <b>SL:</b> ${pos.sl? '$'+pos.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
+
+        if(firebaseDb){
+          try{
+            const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund, position: pos, histMean: histMean, finalEstimate: finalEstimate, blendedNextsSample: blendedNexts.slice(0, Math.min(20, blendedNexts.length)) };
+            await firebaseDb.ref('predictions').push(rec);
+          }catch(e){ console.warn('Failed to save MC preds', e); }
+        }
+
+      }catch(e){ console.warn('Monte Carlo prediction failed', e); analysisResultsEl.innerHTML = `<b>Prediksi gagal:</b> ${e.message || e}`; }
+
     }catch(e){ console.warn('Failed to trigger load for prediction', e); }
   }
 
