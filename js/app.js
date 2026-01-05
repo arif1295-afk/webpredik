@@ -524,6 +524,9 @@ const FIREBASE_DB_CDN = 'https://www.gstatic.com/firebasejs/9.22.1/firebase-data
 let firebaseApp = null;
 let firebaseDb = null;
 
+const mcGridEl = document.getElementById('mcGrid');
+const nextEstimateEl = document.getElementById('nextEstimate');
+
 function loadScript(url){
   return new Promise((resolve,reject)=>{
     if(document.querySelector(`script[src="${url}"]`)) return resolve();
@@ -557,6 +560,41 @@ async function ensurePredictionLibs(){
   }catch(e){
     console.warn('Failed to load prediction libraries', e);
   }
+}
+
+// Read recent historical prediction summaries from Firebase (if available)
+async function fetchHistoricalMean(limit = 200){
+  if(!firebaseDb) return null;
+  try{
+    const snap = await firebaseDb.ref('predictions').orderByChild('timestamp').limitToLast(limit).once('value');
+    const vals = [];
+    snap.forEach(child => {
+      const v = child.val();
+      if(v && v.mc){
+        if(typeof v.mc.mean === 'number') vals.push(v.mc.mean);
+        else if(Array.isArray(v.mc.nextPreds) && v.mc.nextPreds.length) {
+          const m = v.mc.nextPreds.reduce((a,b)=>a+b,0)/v.mc.nextPreds.length; vals.push(m);
+        }
+      }
+    });
+    if(!vals.length) return null;
+    const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
+    return mean;
+  }catch(e){ console.warn('fetchHistoricalMean failed', e); return null; }
+}
+
+function renderMCGrid(preds){
+  if(!mcGridEl) return;
+  mcGridEl.innerHTML = '';
+  // ensure we display up to 100 boxes
+  const show = preds.slice(0,100);
+  show.forEach((v,i)=>{
+    const d = document.createElement('div');
+    d.style.width = '56px'; d.style.height = '28px'; d.style.display='flex'; d.style.alignItems='center'; d.style.justifyContent='center';
+    d.style.fontSize='11px'; d.style.background='#0b1220'; d.style.color='#f8f8f2'; d.style.border='1px solid #333'; d.style.borderRadius='4px';
+    d.textContent = (typeof v === 'number') ? Math.round(v*100)/100 : '—';
+    mcGridEl.appendChild(d);
+  });
 }
 
 // Prediction chart
@@ -612,6 +650,14 @@ if(predToggleBtn){
             const fund = await fetchFundamentals();
             const blend = fundamentalBlendScore(fund);
             const adjustedNext = mc.nextPreds.map(p=>p * blend);
+            // incorporate historical mean from Firebase to bias predictions
+            let histMean = null;
+            try{ histMean = await fetchHistoricalMean(200); }catch(e){ console.warn('histMean fetch err', e); }
+            const blendedNexts = adjustedNext.map(p => (histMean ? (p * 0.6 + histMean * 0.4) : p));
+            const finalEstimate = (histMean ? (mc.mean * 0.6 + histMean * 0.4) : mc.mean);
+            if(nextEstimateEl) nextEstimateEl.textContent = `Perkiraan berikutnya: $${(Math.round(finalEstimate*100)/100).toLocaleString()}`;
+            // render grid of MC small boxes
+            try{ renderMCGrid(blendedNexts); }catch(e){ console.warn('renderMCGrid failed', e); }
 
             // build labels for recent + future
             const recentSlice = data.prices.slice(-predictSteps);
@@ -639,7 +685,7 @@ if(predToggleBtn){
 
             if(firebaseDb){
               try{
-                const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund, position: pos };
+                const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund, position: pos, histMean: histMean, finalEstimate: finalEstimate, blendedNextsSample: blendedNexts.slice(0, Math.min(20, blendedNexts.length)) };
                 await firebaseDb.ref('predictions').push(rec);
               }catch(e){ console.warn('Failed to save MC preds', e); }
             }
