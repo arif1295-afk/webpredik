@@ -18,6 +18,7 @@ const analysisResultsEl = document.getElementById('analysisResults');
 const indicatorCtx = document.getElementById('indicatorChart') && document.getElementById('indicatorChart').getContext('2d');
 const assetToggleBtn = document.getElementById('assetToggleBtn');
 const pageTitle = document.getElementById('pageTitle');
+const predCountdownEl = document.getElementById('predCountdown');
 
 let btcChart = null;
 // Price polling control
@@ -28,6 +29,10 @@ let autoRefreshId = null;
 let autoRefreshActive = false;
 // Auto refresh interval (5 seconds)
 const AUTO_REFRESH_MS = 5 * 1000;
+// Fast chart-only polling (updates chart only, no analysis/prediction)
+let chartPollId = null;
+let chartPollActive = false;
+const CHART_POLL_MS = 5 * 1000; // chart refresh every 5s (tune for mobile)
 // Prediction toggle
 let predActive = false;
 
@@ -413,8 +418,35 @@ function stopAutoRefresh(){
   if(autoRefreshId) clearTimeout(autoRefreshId);
 }
 
-// Start auto-refresh at 5s interval
-startAutoRefresh();
+// Chart-only refresh: fetch latest market_chart and update `btcChart` only
+function startChartPoll(){
+  if(chartPollActive) return;
+  chartPollActive = true;
+  const run = async () => {
+    try{
+      const data = await fetchMarketChart(rangeSelect.value);
+      if(data && Array.isArray(data.prices)){
+        const { labels, values } = prepareDataset(data.prices);
+        renderChart(labels, values);
+        // update price box to match latest value
+        if(priceBox && data.prices.length){
+          const lastPrice = data.prices[data.prices.length - 1][1];
+          if(typeof lastPrice === 'number') priceBox.textContent = `$${lastPrice.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+        }
+      }
+    }catch(e){ /* ignore errors for periodic chart polling */ }
+    if(chartPollActive) chartPollId = setTimeout(run, CHART_POLL_MS);
+  };
+  run();
+}
+
+function stopChartPoll(){
+  chartPollActive = false;
+  if(chartPollId) clearTimeout(chartPollId);
+}
+
+// Start fast chart-only polling at CHART_POLL_MS interval (keeps chart fresh without running analysis)
+startChartPoll();
 
 // --- Machine learning prediction (TF.js) + Firebase storage ---
 // Firebase config placeholder: fill these values if you want to store predictions
@@ -500,58 +532,81 @@ async function clearFirebasePredictions(){
 
 // Prediction toggle button behavior
 if(predToggleBtn){
+  const PRED_COUNTDOWN_SECONDS = 10; // countdown before running heavy prediction
+  let predCountdownTimer = null;
+  let predCountdownRemaining = 0;
+
+  async function startPredictionProcess(){
+    // ensure still active
+    if(!predActive) return;
+    noteEl.textContent = 'Prediksi diaktifkan';
+    try{
+      await ensurePredictionLibs();
+      const data = await loadAndRender(rangeSelect.value);
+      if(data && window.tf && Array.isArray(data.prices) && data.prices.length){
+        const lookback = 8;
+        const predictSteps = Math.min(12, Math.max(3, Math.floor(data.prices.length / 6)));
+        noteEl.textContent = 'Menjalankan prediksi berulang (ini mungkin butuh waktu)...';
+        try{
+          const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, 1000);
+          if(mc){
+            noteEl.textContent = `Hasil MC: trials=${mc.trials} — arah up ${mc.percentUp}% — akurasi rata-rata ${mc.avgAccuracy}% — sinyal: ${mc.suggested}`;
+            const fund = await fetchFundamentals();
+            const blend = fundamentalBlendScore(fund);
+            const adjustedNext = mc.nextPreds.map(p=>p * blend);
+
+            // build labels for recent + future
+            const recentSlice = data.prices.slice(-predictSteps);
+            const recentLabels = recentSlice.map(p=>msToLabel(p[0]));
+            const recentActuals = recentSlice.map(p=>p[1]);
+            const lastTs = data.prices[data.prices.length-1][0];
+            const prevTs = data.prices[data.prices.length-2][0];
+            const step = lastTs - prevTs || 86400000;
+            const predLabels = [];
+            for(let i=1;i<=predictSteps;i++) predLabels.push(msToLabel(lastTs + step * i));
+
+            const combinedLabels = recentLabels.concat(predLabels);
+            const actualSeries = recentActuals.concat(new Array(predictSteps).fill(null));
+            const predictedSeries = new Array(recentActuals.length).fill(null).concat(adjustedNext.map(v=>Math.round(v*100)/100));
+
+            // render combined chart on lower panel
+            renderPredictionChart(combinedLabels, actualSeries, predictedSeries);
+
+            // show TP/SL suggestions and blended info
+            analysisResultsEl.innerHTML = `<b>Sinyal:</b> ${mc.suggested} — Confidence up ${mc.percentUp}% — avg acc ${mc.avgAccuracy}%<br><b>TP:</b> ${mc.tp? '$'+mc.tp.toFixed(2) : '—'} <b>SL:</b> ${mc.sl? '$'+mc.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
+
+            if(firebaseDb){
+              try{
+                const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund };
+                await firebaseDb.ref('predictions').push(rec);
+              }catch(e){ console.warn('Failed to save MC preds', e); }
+            }
+          }
+        }catch(e){ console.warn('Monte Carlo prediction failed', e); }
+      }
+    }catch(e){ console.warn('Failed to trigger load for prediction', e); }
+  }
+
   predToggleBtn.textContent = 'Prediksi: Off';
   predToggleBtn.addEventListener('click', async () => {
     predActive = !predActive;
     predToggleBtn.textContent = predActive ? 'Prediksi: On' : 'Prediksi: Off';
+    // if enabling, start countdown before heavy work
     if(predActive){
-      noteEl.textContent = 'Prediksi diaktifkan';
-        try{
-          await ensurePredictionLibs();
-          const data = await loadAndRender(rangeSelect.value);
-          if(data && window.tf && Array.isArray(data.prices) && data.prices.length){
-            const lookback = 8;
-            const predictSteps = Math.min(12, Math.max(3, Math.floor(data.prices.length / 6)));
-            noteEl.textContent = 'Menjalankan prediksi berulang (ini mungkin butuh waktu)...';
-            try{
-              const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, 1000);
-              if(mc){
-                noteEl.textContent = `Hasil MC: trials=${mc.trials} — arah up ${mc.percentUp}% — akurasi rata-rata ${mc.avgAccuracy}% — sinyal: ${mc.suggested}`;
-                const fund = await fetchFundamentals();
-                const blend = fundamentalBlendScore(fund);
-                const adjustedNext = mc.nextPreds.map(p=>p * blend);
-
-                // build labels for recent + future
-                const recentSlice = data.prices.slice(-predictSteps);
-                const recentLabels = recentSlice.map(p=>msToLabel(p[0]));
-                const recentActuals = recentSlice.map(p=>p[1]);
-                const lastTs = data.prices[data.prices.length-1][0];
-                const prevTs = data.prices[data.prices.length-2][0];
-                const step = lastTs - prevTs || 86400000;
-                const predLabels = [];
-                for(let i=1;i<=predictSteps;i++) predLabels.push(msToLabel(lastTs + step * i));
-
-                const combinedLabels = recentLabels.concat(predLabels);
-                const actualSeries = recentActuals.concat(new Array(predictSteps).fill(null));
-                const predictedSeries = new Array(recentActuals.length).fill(null).concat(adjustedNext.map(v=>Math.round(v*100)/100));
-
-                // render combined chart on lower panel
-                renderPredictionChart(combinedLabels, actualSeries, predictedSeries);
-
-                // show TP/SL suggestions and blended info
-                analysisResultsEl.innerHTML = `<b>Sinyal:</b> ${mc.suggested} — Confidence up ${mc.percentUp}% — avg acc ${mc.avgAccuracy}%<br><b>TP:</b> ${mc.tp? '$'+mc.tp.toFixed(2) : '—'} <b>SL:</b> ${mc.sl? '$'+mc.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`;
-
-                if(firebaseDb){
-                  try{
-                    const rec = { timestamp:(new Date()).toISOString(), lookback, predictSteps, mc, blend, fundamentals: fund };
-                    await firebaseDb.ref('predictions').push(rec);
-                  }catch(e){ console.warn('Failed to save MC preds', e); }
-                }
-              }
-            }catch(e){ console.warn('Monte Carlo prediction failed', e); }
-          }
-        }catch(e){ console.warn('Failed to trigger load for prediction', e); }
+      predCountdownRemaining = PRED_COUNTDOWN_SECONDS;
+      if(predCountdownEl) predCountdownEl.textContent = `Mulai prediksi dalam ${predCountdownRemaining}s`;
+      predCountdownTimer = setInterval(()=>{
+        predCountdownRemaining -= 1;
+        if(predCountdownEl) predCountdownEl.textContent = predCountdownRemaining>0 ? `Mulai prediksi dalam ${predCountdownRemaining}s` : '';
+        if(predCountdownRemaining <= 0){
+          clearInterval(predCountdownTimer); predCountdownTimer = null; if(predCountdownEl) predCountdownEl.textContent = '';
+          // start heavy prediction
+          startPredictionProcess();
+        }
+      }, 1000);
     }else{
+      // disabling: cancel countdown or running predictions and clear UI
+      if(predCountdownTimer){ clearInterval(predCountdownTimer); predCountdownTimer = null; if(predCountdownEl) predCountdownEl.textContent = ''; }
       noteEl.textContent = 'Menghentikan prediksi...';
       if(firebaseDb){
         noteEl.textContent = 'Menghapus data prediksi di Firebase...';
