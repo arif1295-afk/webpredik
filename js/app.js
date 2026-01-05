@@ -29,6 +29,8 @@ let autoRefreshId = null;
 let autoRefreshActive = false;
 // Auto refresh interval (5 seconds)
 const AUTO_REFRESH_MS = 5 * 1000;
+// If true, suppress non-error status messages in `noteEl` during automatic polling
+const SILENT_FETCH = true;
 // Fast chart-only polling (updates chart only, no analysis/prediction)
 let chartPollId = null;
 let chartPollActive = false;
@@ -42,7 +44,7 @@ function msToLabel(ms){
 }
 
 async function fetchMarketChart(days = 30){
-  noteEl.textContent = 'Meminta data dari CoinGecko...';
+  if(!SILENT_FETCH) noteEl.textContent = 'Meminta data dari CoinGecko...';
   const url = `${BASE}/coins/${ASSET_ID}/market_chart?vs_currency=usd&days=${days}`;
   try{
     const headers = BASE === PRO_BASE && API_KEY ? { 'x-cg-pro-api-key': API_KEY } : {};
@@ -256,11 +258,11 @@ updatePageTitleAndButtons();
 // ----- Fundamental analysis -----
 async function performFundamentalAnalysis(){
   try{
-    analysisResultsEl.textContent = 'Meminta data fundamental...';
+    if(!SILENT_FETCH) analysisResultsEl.textContent = 'Meminta data fundamental...';
     const url = `${BASE}/coins/${ASSET_ID}?localization=false&tickers=false&market_data=true`;
     const headers = BASE === PRO_BASE && API_KEY ? { 'x-cg-pro-api-key': API_KEY } : {};
     const res = await fetch(url, { headers });
-    if(!res.ok){ analysisResultsEl.textContent = 'Gagal mengambil data fundamental.'; return; }
+    if(!res.ok){ if(!SILENT_FETCH) analysisResultsEl.textContent = 'Gagal mengambil data fundamental.'; return; }
     const j = await res.json();
     const md = j.market_data || {};
     const mc = md.market_cap && md.market_cap.usd ? md.market_cap.usd : null;
@@ -279,7 +281,7 @@ async function performFundamentalAnalysis(){
     // small indicator: market cap rank if available
     if(j.market_cap_rank) analysisResultsEl.innerHTML += `<br>Rank pasar: ${j.market_cap_rank}`;
   }catch(e){
-    console.error(e); analysisResultsEl.textContent = 'Kesalahan saat mengambil data fundamental.';
+    console.error(e); if(!SILENT_FETCH) analysisResultsEl.textContent = 'Kesalahan saat mengambil data fundamental.';
   }
 }
 
@@ -359,7 +361,7 @@ async function loadAndRender(days){
   try{
     const data = await fetchMarketChart(days);
     if(!data || !data.prices){
-      noteEl.textContent = 'Respons tidak berisi data harga.';
+      if(!SILENT_FETCH) noteEl.textContent = 'Respons tidak berisi data harga.';
       return;
     }
     const {labels, values} = prepareDataset(data.prices);
@@ -378,7 +380,7 @@ async function loadAndRender(days){
       console.error('Failed to update price box from chart data', e);
     }
 
-    noteEl.textContent = `Terakhir dimuat: ${new Date().toLocaleString()} — rentang ${days} hari`;
+    if(!SILENT_FETCH) noteEl.textContent = `Terakhir dimuat: ${new Date().toLocaleString()} — rentang ${days} hari`;
     // NOTE: removed automatic background prediction here so predictions
     // do not run during auto-refresh. Prediction should be triggered
     // explicitly (e.g. when the user enables the toggle).
@@ -422,6 +424,8 @@ function stopAutoRefresh(){
 function startChartPoll(){
   if(chartPollActive) return;
   chartPollActive = true;
+  let chartPollCounter = 0;
+  const FUNDAMENTAL_INTERVAL = Math.max(1, Math.floor(60000 / CHART_POLL_MS));
   const run = async () => {
     try{
       const data = await fetchMarketChart(rangeSelect.value);
@@ -432,6 +436,13 @@ function startChartPoll(){
         if(priceBox && data.prices.length){
           const lastPrice = data.prices[data.prices.length - 1][1];
           if(typeof lastPrice === 'number') priceBox.textContent = `$${lastPrice.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+        }
+        // update technical indicators continuously (lighter than running full ML prediction)
+        try{ performTechnicalAnalysis(data.prices); }catch(e){ /* ignore indicator errors */ }
+        // fetch fundamentals less frequently to reduce API usage
+        chartPollCounter++;
+        if(chartPollCounter % FUNDAMENTAL_INTERVAL === 0){
+          try{ performFundamentalAnalysis(); }catch(e){ /* ignore */ }
         }
       }
     }catch(e){ /* ignore errors for periodic chart polling */ }
@@ -464,8 +475,12 @@ const firebaseConfig = {
 // Use provided config or fall back to the local placeholder above.
 const FIREBASE_CONFIG = window.FIREBASE_CONFIG || firebaseConfig;
 
-// CDN locations for lazy-loading prediction libraries
-const TF_CDN = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js';
+// CDN locations for lazy-loading prediction libraries (try fallbacks)
+const TF_CDNS = [
+  'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js',
+  'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.9.0/dist/tf.min.js',
+  'https://unpkg.com/@tensorflow/tfjs@4.10.0/dist/tf.min.js'
+];
 const FIREBASE_APP_CDN = 'https://www.gstatic.com/firebasejs/9.22.1/firebase-app-compat.js';
 const FIREBASE_DB_CDN = 'https://www.gstatic.com/firebasejs/9.22.1/firebase-database-compat.js';
 
@@ -484,7 +499,13 @@ function loadScript(url){
 
 async function ensurePredictionLibs(){
   try{
-    if(!window.tf) await loadScript(TF_CDN);
+    if(!window.tf){
+      let loaded = false;
+      for(const url of TF_CDNS){
+        try{ await loadScript(url); if(window.tf){ loaded = true; break; } }catch(e){ console.warn('TF CDN load failed', url, e); }
+      }
+      if(!loaded) throw new Error('Failed to load TensorFlow.js from all CDNs');
+    }
     if(!window.firebase) {
       await loadScript(FIREBASE_APP_CDN);
       await loadScript(FIREBASE_DB_CDN);
@@ -533,24 +554,25 @@ async function clearFirebasePredictions(){
 // Prediction toggle button behavior
 if(predToggleBtn){
   const PRED_COUNTDOWN_SECONDS = 10; // countdown before running heavy prediction
+  const MC_TRIALS = 100; // default Monte Carlo trials (reduced for responsiveness)
   let predCountdownTimer = null;
   let predCountdownRemaining = 0;
 
   async function startPredictionProcess(){
     // ensure still active
     if(!predActive) return;
-    noteEl.textContent = 'Prediksi diaktifkan';
+    if(!SILENT_FETCH) noteEl.textContent = 'Prediksi diaktifkan';
     try{
       await ensurePredictionLibs();
       const data = await loadAndRender(rangeSelect.value);
       if(data && window.tf && Array.isArray(data.prices) && data.prices.length){
         const lookback = 8;
         const predictSteps = Math.min(12, Math.max(3, Math.floor(data.prices.length / 6)));
-        noteEl.textContent = 'Menjalankan prediksi berulang (ini mungkin butuh waktu)...';
+            if(!SILENT_FETCH) noteEl.textContent = 'Menjalankan prediksi berulang (ini mungkin butuh waktu)...';
         try{
-          const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, 1000);
-          if(mc){
-            noteEl.textContent = `Hasil MC: trials=${mc.trials} — arah up ${mc.percentUp}% — akurasi rata-rata ${mc.avgAccuracy}% — sinyal: ${mc.suggested}`;
+          const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, MC_TRIALS);
+            if(mc){
+            if(!SILENT_FETCH) noteEl.textContent = `Hasil MC: trials=${mc.trials} — arah up ${mc.percentUp}% — akurasi rata-rata ${mc.avgAccuracy}% — sinyal: ${mc.suggested}`;
             const fund = await fetchFundamentals();
             const blend = fundamentalBlendScore(fund);
             const adjustedNext = mc.nextPreds.map(p=>p * blend);
@@ -582,7 +604,7 @@ if(predToggleBtn){
               }catch(e){ console.warn('Failed to save MC preds', e); }
             }
           }
-        }catch(e){ console.warn('Monte Carlo prediction failed', e); }
+        }catch(e){ console.warn('Monte Carlo prediction failed', e); analysisResultsEl.innerHTML = `<b>Prediksi gagal:</b> ${e.message || e}`; }
       }
     }catch(e){ console.warn('Failed to trigger load for prediction', e); }
   }
@@ -607,13 +629,13 @@ if(predToggleBtn){
     }else{
       // disabling: cancel countdown or running predictions and clear UI
       if(predCountdownTimer){ clearInterval(predCountdownTimer); predCountdownTimer = null; if(predCountdownEl) predCountdownEl.textContent = ''; }
-      noteEl.textContent = 'Menghentikan prediksi...';
+      if(!SILENT_FETCH) noteEl.textContent = 'Menghentikan prediksi...';
       if(firebaseDb){
-        noteEl.textContent = 'Menghapus data prediksi di Firebase...';
+        if(!SILENT_FETCH) noteEl.textContent = 'Menghapus data prediksi di Firebase...';
         const ok = await clearFirebasePredictions();
-        noteEl.textContent = ok ? 'Semua data prediksi di Firebase telah dihapus.' : 'Gagal menghapus data prediksi di Firebase.';
+        if(!SILENT_FETCH) noteEl.textContent = ok ? 'Semua data prediksi di Firebase telah dihapus.' : 'Gagal menghapus data prediksi di Firebase.';
       }else{
-        noteEl.textContent = 'Prediksi dihentikan (Firebase tidak dikonfigurasi).';
+        if(!SILENT_FETCH) noteEl.textContent = 'Prediksi dihentikan (Firebase tidak dikonfigurasi).';
       }
       if(_indicatorChart){
         _indicatorChart.data.labels = [];
