@@ -34,7 +34,22 @@
       <button id="refreshBtn">Refresh</button>
       <button id="predToggleBtn">Prediksi: Off</button>
       <span id="predCountdown" style="margin-left:10px;color:#ff9900"></span>
-      <button id="assetToggleBtn">Ganti Asset</button>
+      <label style="margin-left:8px">Asset:
+        <select id="assetSelect">
+          <optgroup label="Crypto/Metal">
+            <option value="bitcoin|crypto">BTC / USD</option>
+            <option value="tether-gold|metal" selected>XAU / USD</option>
+          </optgroup>
+          <optgroup label="Saham Indonesia">
+            <option value="BBCA.JK|stock">BBCA (Bank Central Asia)</option>
+            <option value="BBRI.JK|stock">BBRI (Bank Rakyat Indonesia)</option>
+            <option value="TLKM.JK|stock">TLKM (Telkom Indonesia)</option>
+            <option value="ASII.JK|stock">ASII (Astra International)</option>
+            <option value="UNVR.JK|stock">UNVR (Unilever Indonesia)</option>
+            <option value=" BMRI.JK|stock">BMRI (Bank Mandiri)</option>
+          </optgroup>
+        </select>
+      </label>
       <button id="adviceBtn" style="margin-left:8px">Minta Saran</button>
     </div>
 

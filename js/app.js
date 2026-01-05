@@ -17,6 +17,7 @@ const predToggleBtn = document.getElementById('predToggleBtn');
 const analysisResultsEl = document.getElementById('analysisResults');
 const indicatorCtx = document.getElementById('indicatorChart') && document.getElementById('indicatorChart').getContext('2d');
 const assetToggleBtn = document.getElementById('assetToggleBtn');
+const assetSelect = document.getElementById('assetSelect');
 const pageTitle = document.getElementById('pageTitle');
 const predCountdownEl = document.getElementById('predCountdown');
 
@@ -37,13 +38,89 @@ let chartPollActive = false;
 const CHART_POLL_MS = 5 * 1000; // chart refresh every 5s (tune for mobile)
 // Prediction toggle
 let predActive = false;
+// asset type: 'crypto'|'metal' (handled via CoinGecko) or 'stock' (Alpha Vantage)
+let ASSET_TYPE = window.ASSET_TYPE || 'crypto';
 
 function msToLabel(ms){
   const d = new Date(ms);
   return d.toLocaleString();
 }
 
+function formatPrice(v){
+  if(v === null || typeof v === 'undefined') return '—';
+  if(ASSET_TYPE === 'stock') return `Rp ${Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+  return `$${Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+}
+
+// Public refill function used by monitors and by immediate refresh after showing status
+async function refillBoxGlobal(idx, sessionKey){
+  try{
+    // attempt quick local prediction using trainAndPredict on lastMarketData
+    let nextPred = null;
+    if(window.tf && lastMarketData){
+      try{ const r = await trainAndPredict(lastMarketData.prices, 8, 1); if(r && Array.isArray(r.preds) && r.preds.length) nextPred = r.preds[0]; }catch(e){ console.warn('refill train failed', e); }
+    }
+    if(nextPred === null){ // fallback jitter
+      const cur = await getLatestPrice(); if(typeof cur === 'number'){ nextPred = cur * (1 + (Math.random()-0.5)*0.02); } else nextPred = (boxStates[idx] && boxStates[idx].predicted) ? boxStates[idx].predicted * (1 + (Math.random()-0.5)*0.02) : null;
+    }
+    const lastPrice = (lastMarketData && lastMarketData.prices && lastMarketData.prices.length) ? lastMarketData.prices[lastMarketData.prices.length-1][1] : await getLatestPrice();
+    let tp_box=null, sl_box=null;
+    if(nextPred > lastPrice){ tp_box = nextPred; sl_box = Math.max(0, lastPrice - (nextPred - lastPrice)); }
+    else if(nextPred < lastPrice){ tp_box = nextPred; sl_box = lastPrice + (lastPrice - nextPred); }
+    boxStates[idx] = { id: idx, active:true, predicted: nextPred, tp: tp_box, sl: sl_box, startedAt: Date.now() };
+    // update UI
+    const items = boxStates.map(s => s && s.active ? { start: lastPrice, pred: Math.round(s.predicted*100)/100, tp: s.tp, sl: s.sl, percent: null } : null);
+    try{ renderMCGrid(items, lastPrice); }catch(e){}
+    // save new box start to firebase under session (optional)
+    if(firebaseDb && sessionKey){
+      try{
+        const ev = { type: 'boxStart', box: idx, predicted: nextPred, tp: tp_box, sl: sl_box, ts:(new Date()).toISOString() };
+        await firebaseDb.ref(`predictions/${sessionKey}/events`).push(ev);
+      }catch(e){ console.warn('Failed to save boxStart', e); }
+    }
+  }catch(e){ console.warn('refillBoxGlobal failed', e); }
+}
+
+// Fetch helper for stocks via Alpha Vantage (simple REST fallback).
+// Requires window.ALPHA_VANTAGE_KEY to be set by the host page.
+async function fetchStockMarket(symbol, days = 30){
+  const key = window.ALPHA_VANTAGE_KEY;
+  if(!key) throw new Error('Alpha Vantage API key not configured (window.ALPHA_VANTAGE_KEY)');
+  // Use TIME_SERIES_DAILY_ADJUSTED to get daily closes
+  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=${encodeURIComponent(symbol)}&outputsize=compact&apikey=${encodeURIComponent(key)}`;
+  const res = await fetch(url);
+  const j = await res.json();
+  if(j['Error Message'] || j['Note']){
+    throw new Error(j['Error Message'] || j['Note'] || 'AlphaVantage error');
+  }
+  const series = j['Time Series (Daily)'];
+  if(!series) throw new Error('AlphaVantage returned no time series');
+  const dates = Object.keys(series).sort(); // ascending
+  const prices = dates.map(d => {
+    const ts = new Date(d + 'T00:00:00Z').getTime();
+    const close = parseFloat(series[d]['4. close']);
+    return [ts, close];
+  });
+  return { prices: prices.slice(-days) };
+}
+
+async function fetchStockCurrentPrice(symbol){
+  const key = window.ALPHA_VANTAGE_KEY;
+  if(!key) return null;
+  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(key)}`;
+  const res = await fetch(url);
+  const j = await res.json();
+  if(!j || !j['Global Quote']) return null;
+  const p = parseFloat(j['Global Quote']['05. price']);
+  return isFinite(p) ? p : null;
+}
+
 async function fetchMarketChart(days = 30){
+  // If the selected asset is a stock, use the Alpha Vantage helper instead
+  if(ASSET_TYPE === 'stock'){
+    if(!SILENT_FETCH) noteEl.textContent = `Meminta data saham ${ASSET_ID}...`;
+    return await fetchStockMarket(ASSET_ID, days);
+  }
   if(!SILENT_FETCH) noteEl.textContent = 'Meminta data dari CoinGecko...';
   const url = `${BASE}/coins/${ASSET_ID}/market_chart?vs_currency=usd&days=${days}`;
   try{
@@ -80,33 +157,7 @@ async function fetchMarketChart(days = 30){
 function startBoxMonitors(sessionKey){
   if(!boxStates || !boxStates.length) return;
   const pollMs = 3000;
-  const refillBox = async (idx)=>{
-    try{
-      // attempt quick local prediction using trainAndPredict on lastMarketData
-      let nextPred = null;
-      if(window.tf && lastMarketData){
-        try{ const r = await trainAndPredict(lastMarketData.prices, 8, 1); if(r && Array.isArray(r.preds) && r.preds.length) nextPred = r.preds[0]; }catch(e){ console.warn('refill train failed', e); }
-      }
-      if(nextPred === null){ // fallback jitter
-        const cur = await getLatestPrice(); if(typeof cur === 'number'){ nextPred = cur * (1 + (Math.random()-0.5)*0.02); } else nextPred = (boxStates[idx] && boxStates[idx].predicted) ? boxStates[idx].predicted * (1 + (Math.random()-0.5)*0.02) : null;
-      }
-      const lastPrice = (lastMarketData && lastMarketData.prices && lastMarketData.prices.length) ? lastMarketData.prices[lastMarketData.prices.length-1][1] : await getLatestPrice();
-      let tp_box=null, sl_box=null;
-      if(nextPred > lastPrice){ tp_box = nextPred; sl_box = Math.max(0, lastPrice - (nextPred - lastPrice)); }
-      else if(nextPred < lastPrice){ tp_box = nextPred; sl_box = lastPrice + (lastPrice - nextPred); }
-      boxStates[idx] = { id: idx, active:true, predicted: nextPred, tp: tp_box, sl: sl_box, startedAt: Date.now() };
-      // update UI
-      const items = boxStates.map(s => s && s.active ? { pred: Math.round(s.predicted*100)/100, tp: s.tp, sl: s.sl, percent: null } : null);
-      try{ renderMCGrid(items, lastPrice); }catch(e){}
-      // save new box start to firebase under session (optional)
-      if(firebaseDb && sessionKey){
-        try{
-          const ev = { type: 'boxStart', box: idx, predicted: nextPred, tp: tp_box, sl: sl_box, ts:(new Date()).toISOString() };
-          await firebaseDb.ref(`predictions/${sessionKey}/events`).push(ev);
-        }catch(e){ console.warn('Failed to save boxStart', e); }
-      }
-    }catch(e){ console.warn('refillBox failed', e); }
-  };
+  // refillBoxGlobal is used to refill boxes on demand
 
   // polling loop
   const id = setInterval(async ()=>{
@@ -125,7 +176,7 @@ function startBoxMonitors(sessionKey){
           try{ renderMCGrid(boxStates.map(b => b && b.active ? { pred: Math.round(b.predicted*100)/100, tp: b.tp, sl: b.sl } : null), price); }catch(e){}
           if(firebaseDb && sessionKey){ try{ await firebaseDb.ref(`predictions/${sessionKey}/events`).push({ type:'boxResult', box:i, result:'TP', finalPrice:price, duration, ts:(new Date()).toISOString() }); }catch(e){ console.warn('save boxResult TP failed', e); } }
           // refill immediately
-          refillBox(i);
+          try{ await refillBoxGlobal(i, sessionKey); }catch(e){ console.warn('refill global failed', e); }
         }else if(typeof s.sl === 'number' && price <= s.sl){
           // SL hit
           s.active = false;
@@ -133,7 +184,7 @@ function startBoxMonitors(sessionKey){
           try{ renderMCGrid(boxStates.map(b => b && b.active ? { pred: Math.round(b.predicted*100)/100, tp: b.tp, sl: b.sl } : null), price); }catch(e){}
           if(firebaseDb && sessionKey){ try{ await firebaseDb.ref(`predictions/${sessionKey}/events`).push({ type:'boxResult', box:i, result:'SL', finalPrice:price, duration, ts:(new Date()).toISOString() }); }catch(e){ console.warn('save boxResult SL failed', e); } }
           // refill immediately
-          refillBox(i);
+          try{ await refillBoxGlobal(i, sessionKey); }catch(e){ console.warn('refill global failed', e); }
         }
       }
     }catch(err){ console.error('box monitor error', err); }
@@ -144,8 +195,17 @@ function startBoxMonitors(sessionKey){
 // Fetch current BTC price once (do not update dynamically to avoid interfering with chart)
 async function fetchCurrentPrice(){
   if(!priceBox) return;
-  const url = `${BASE}/simple/price?ids=${ASSET_ID}&vs_currencies=usd`;
   try{
+    if(ASSET_TYPE === 'stock'){
+      const p = await fetchStockCurrentPrice(ASSET_ID);
+      if(p && typeof p === 'number'){
+        priceBox.textContent = `Rp ${p.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+      }else{
+        priceBox.textContent = '—';
+      }
+      return;
+    }
+    const url = `${BASE}/simple/price?ids=${ASSET_ID}&vs_currencies=usd`;
     const headers = BASE === PRO_BASE && API_KEY ? { 'x-cg-pro-api-key': API_KEY } : {};
     // avoid cache so we get the freshest price
     const res = await fetch(url, { headers, cache: 'no-store' });
@@ -495,6 +555,35 @@ async function loadAndRender(days){
 refreshBtn.addEventListener('click', () => loadAndRender(rangeSelect.value));
 rangeSelect.addEventListener('change', () => loadAndRender(rangeSelect.value));
 
+// Asset selector: update globals and reload chart when user changes asset
+if(assetSelect){
+  // initialize from selector value if present
+  try{
+    const parts = (assetSelect.value||'').split('|');
+    if(parts[0]) ASSET_ID = parts[0].trim();
+    if(parts[1]) ASSET_TYPE = parts[1].trim();
+    // set readable label/pair
+    const label = (ASSET_LABEL && ASSET_LABEL.length) ? ASSET_LABEL : (ASSET_ID.split(/[\-|\.]/)[0]||ASSET_ID).toUpperCase();
+    ASSET_LABEL = label;
+    ASSET_PAIR = ASSET_TYPE === 'stock' ? `${label} / IDR` : `${label} / USD`;
+    pageTitle.textContent = `Grafik Harga — ${ASSET_PAIR}`;
+  }catch(e){ console.warn('assetSelect init failed', e); }
+  assetSelect.addEventListener('change', () => {
+    try{
+      const parts = (assetSelect.value||'').split('|');
+      ASSET_ID = parts[0].trim();
+      ASSET_TYPE = parts[1] ? parts[1].trim() : 'crypto';
+      const label = ASSET_ID.split(/[\-|\.]/)[0].toUpperCase();
+      ASSET_LABEL = label;
+      ASSET_PAIR = ASSET_TYPE === 'stock' ? `${label} / IDR` : `${label} / USD`;
+      pageTitle.textContent = `Grafik Harga — ${ASSET_PAIR}`;
+      loadAndRender(rangeSelect.value);
+      // refresh current price immediately
+      fetchCurrentPrice();
+    }catch(e){ console.error('assetSelect change handler error', e); }
+  });
+}
+
 // Inisialisasi
 loadAndRender(rangeSelect.value);
 
@@ -698,23 +787,22 @@ function renderMCGrid(preds, lastPrice){
   while(show.length < BOX_COUNT) show.push(null);
   show.forEach((v,i)=>{
     const d = document.createElement('div');
-    d.style.width = '140px'; d.style.height = '84px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
+    d.style.width = '160px'; d.style.height = '96px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
     d.style.fontSize='14px'; d.style.border='1px solid #333'; d.style.borderRadius='8px';
     d.style.color = '#f8f8f2'; d.style.padding = '8px';
-    // if v is an object with advice/prediction details, render that
     if(v && typeof v === 'object'){
       d.style.background = v.color || (typeof v.percent === 'number' && v.percent >= 60 ? '#064' : (typeof v.percent === 'number' && v.percent <= 40 ? '#640' : '#333'));
-      const top = document.createElement('div'); top.style.fontSize='16px'; top.style.fontWeight='700'; top.textContent = v.pred !== undefined ? `${v.pred}` : (v.text || '—');
-      d.appendChild(top);
-      // TP / SL lines
-      if(typeof v.tp !== 'undefined' || typeof v.sl !== 'undefined'){
-        const tp = document.createElement('div'); tp.style.fontSize='13px'; tp.style.opacity='0.95'; tp.style.fontWeight='600'; tp.textContent = `TP: ${typeof v.tp==='number'? ('$'+(Math.round(v.tp*100)/100)) : '—'}`;
-        const sl = document.createElement('div'); sl.style.fontSize='13px'; sl.style.opacity='0.95'; sl.style.fontWeight='600'; sl.textContent = `SL: ${typeof v.sl==='number'? ('$'+(Math.round(v.sl*100)/100)) : '—'}`;
-        d.appendChild(tp); d.appendChild(sl);
-      } else {
-        const p = document.createElement('div'); p.style.fontSize='13px'; p.style.opacity = '0.95'; p.textContent = (typeof v.percent === 'number') ? `${v.percent}%` : '—';
-        d.appendChild(p);
-      }
+      // Start price (first line)
+      const start = document.createElement('div'); start.style.fontSize='13px'; start.style.opacity='0.95'; start.style.fontWeight='600'; start.textContent = `Start: ${formatPrice(typeof v.start !== 'undefined' ? v.start : lastPrice)}`;
+      d.appendChild(start);
+      // TP
+      const tp = document.createElement('div'); tp.style.fontSize='13px'; tp.style.opacity='0.95'; tp.style.fontWeight='600'; tp.textContent = `TP: ${typeof v.tp==='number'? formatPrice(v.tp) : '—'}`;
+      // SL
+      const sl = document.createElement('div'); sl.style.fontSize='13px'; sl.style.opacity='0.95'; sl.style.fontWeight='600'; sl.textContent = `SL: ${typeof v.sl==='number'? formatPrice(v.sl) : '—'}`;
+      d.appendChild(tp); d.appendChild(sl);
+      // Status text (4th field)
+      const st = document.createElement('div'); st.style.fontSize='13px'; st.style.marginTop='6px'; st.style.fontWeight='700'; st.textContent = v.status ? v.status : '';
+      d.appendChild(st);
     }else{
       d.style.background = '#111'; d.style.opacity = 0.5; d.textContent = '—';
     }
@@ -897,6 +985,31 @@ if(predToggleBtn){
         }
         try{ renderMCGrid(adviceItems, lastPrice); }catch(e){ console.warn('renderMCGrid advice render failed', e); }
 
+        // Immediately show a simple status per box (berhasil/gagal) based on whether predicted > start price,
+        // then refresh those boxes again so they cycle.
+        try{
+          for(let i=0;i<adviceItems.length;i++){
+            const it = adviceItems[i];
+            if(!it) continue;
+            it.start = lastPrice;
+            if(typeof it.pred === 'number'){
+              it.status = (it.pred > lastPrice) ? 'Berhasil' : (it.pred < lastPrice ? 'Gagal' : 'Netral');
+            }else{
+              it.status = '—';
+            }
+          }
+          renderMCGrid(adviceItems, lastPrice);
+          // after showing status, immediately refill completed boxes so they refresh
+          setTimeout(()=>{
+            for(let i=0;i<adviceItems.length;i++){
+              if(!adviceItems[i]) continue;
+              // mark inactive locally
+              if(boxStates[i]) boxStates[i].active = false;
+              try{ refillBoxGlobal(i, null); }catch(e){ console.warn('immediate refill failed', e); }
+            }
+          }, 800);
+        }catch(e){ console.warn('status display/refill failed', e); }
+
         // show TP/SL suggestions and blended info with numeric score (kept hidden if UI prefers)
         try{ analysisResultsEl.innerHTML = `<b>Rekomendasi:</b> ${pos.position} (score ${pos.score}) — Confidence up ${mc && mc.percentUp? mc.percentUp : '—'}% — avg acc ${mc && mc.avgAccuracy? mc.avgAccuracy : '—'}%<br><b>TP:</b> ${pos.tp? '$'+pos.tp.toFixed(2) : '—'} <b>SL:</b> ${pos.sl? '$'+pos.sl.toFixed(2) : '—'}<br>${fund? 'Blended x'+blend.toFixed(3) : ''}`; }catch(e){}
 
@@ -934,6 +1047,11 @@ if(predToggleBtn){
   // Helper: fetch latest price (returns number or null)
   async function getLatestPrice(){
     try{
+      if(ASSET_TYPE === 'stock'){
+        const p = await fetchStockCurrentPrice(ASSET_ID);
+        if(typeof p === 'number'){ if(priceBox) priceBox.textContent = formatPrice(p); return p; }
+        return null;
+      }
       const url = `${BASE}/simple/price?ids=${ASSET_ID}&vs_currencies=usd`;
       const headers = BASE === PRO_BASE && API_KEY ? { 'x-cg-pro-api-key': API_KEY } : {};
       const res = await fetch(url, { headers, cache: 'no-store' });
@@ -941,7 +1059,7 @@ if(predToggleBtn){
       const j = await res.json();
       const price = j && j[ASSET_ID] && j[ASSET_ID].usd;
       if(typeof price === 'number'){
-        if(priceBox) priceBox.textContent = `$${(Math.round(price*100)/100).toLocaleString()}`;
+        if(priceBox) priceBox.textContent = formatPrice(price);
         return price;
       }
       return null;
