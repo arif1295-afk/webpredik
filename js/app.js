@@ -76,6 +76,70 @@ async function fetchMarketChart(days = 30){
   }
 }
 
+// Per-box monitor: watches live price and completes/refills boxes individually
+function startBoxMonitors(sessionKey){
+  if(!boxStates || !boxStates.length) return;
+  const pollMs = 3000;
+  const refillBox = async (idx)=>{
+    try{
+      // attempt quick local prediction using trainAndPredict on lastMarketData
+      let nextPred = null;
+      if(window.tf && lastMarketData){
+        try{ const r = await trainAndPredict(lastMarketData.prices, 8, 1); if(r && Array.isArray(r.preds) && r.preds.length) nextPred = r.preds[0]; }catch(e){ console.warn('refill train failed', e); }
+      }
+      if(nextPred === null){ // fallback jitter
+        const cur = await getLatestPrice(); if(typeof cur === 'number'){ nextPred = cur * (1 + (Math.random()-0.5)*0.02); } else nextPred = (boxStates[idx] && boxStates[idx].predicted) ? boxStates[idx].predicted * (1 + (Math.random()-0.5)*0.02) : null;
+      }
+      const lastPrice = (lastMarketData && lastMarketData.prices && lastMarketData.prices.length) ? lastMarketData.prices[lastMarketData.prices.length-1][1] : await getLatestPrice();
+      let tp_box=null, sl_box=null;
+      if(nextPred > lastPrice){ tp_box = nextPred; sl_box = Math.max(0, lastPrice - (nextPred - lastPrice)); }
+      else if(nextPred < lastPrice){ tp_box = nextPred; sl_box = lastPrice + (lastPrice - nextPred); }
+      boxStates[idx] = { id: idx, active:true, predicted: nextPred, tp: tp_box, sl: sl_box, startedAt: Date.now() };
+      // update UI
+      const items = boxStates.map(s => s && s.active ? { pred: Math.round(s.predicted*100)/100, tp: s.tp, sl: s.sl, percent: null } : null);
+      try{ renderMCGrid(items, lastPrice); }catch(e){}
+      // save new box start to firebase under session (optional)
+      if(firebaseDb && sessionKey){
+        try{
+          const ev = { type: 'boxStart', box: idx, predicted: nextPred, tp: tp_box, sl: sl_box, ts:(new Date()).toISOString() };
+          await firebaseDb.ref(`predictions/${sessionKey}/events`).push(ev);
+        }catch(e){ console.warn('Failed to save boxStart', e); }
+      }
+    }catch(e){ console.warn('refillBox failed', e); }
+  };
+
+  // polling loop
+  const id = setInterval(async ()=>{
+    try{
+      const price = await getLatestPrice();
+      if(typeof price !== 'number') return;
+      // update lastMarketData latest price timestamp if available
+      if(lastMarketData && lastMarketData.prices && lastMarketData.prices.length){ lastMarketData.prices[lastMarketData.prices.length-1][1] = price; }
+      for(let i=0;i<boxStates.length;i++){
+        const s = boxStates[i];
+        if(!s || !s.active) continue;
+        if(typeof s.tp === 'number' && price >= s.tp){
+          // TP hit
+          s.active = false;
+          const duration = Math.floor((Date.now() - s.startedAt)/1000);
+          try{ renderMCGrid(boxStates.map(b => b && b.active ? { pred: Math.round(b.predicted*100)/100, tp: b.tp, sl: b.sl } : null), price); }catch(e){}
+          if(firebaseDb && sessionKey){ try{ await firebaseDb.ref(`predictions/${sessionKey}/events`).push({ type:'boxResult', box:i, result:'TP', finalPrice:price, duration, ts:(new Date()).toISOString() }); }catch(e){ console.warn('save boxResult TP failed', e); } }
+          // refill immediately
+          refillBox(i);
+        }else if(typeof s.sl === 'number' && price <= s.sl){
+          // SL hit
+          s.active = false;
+          const duration = Math.floor((Date.now() - s.startedAt)/1000);
+          try{ renderMCGrid(boxStates.map(b => b && b.active ? { pred: Math.round(b.predicted*100)/100, tp: b.tp, sl: b.sl } : null), price); }catch(e){}
+          if(firebaseDb && sessionKey){ try{ await firebaseDb.ref(`predictions/${sessionKey}/events`).push({ type:'boxResult', box:i, result:'SL', finalPrice:price, duration, ts:(new Date()).toISOString() }); }catch(e){ console.warn('save boxResult SL failed', e); } }
+          // refill immediately
+          refillBox(i);
+        }
+      }
+    }catch(err){ console.error('box monitor error', err); }
+  }, pollMs);
+}
+
 // Fetch current BTC price (simple endpoint) and update priceBox
 // Fetch current BTC price once (do not update dynamically to avoid interfering with chart)
 async function fetchCurrentPrice(){
@@ -529,6 +593,8 @@ const nextEstimateEl = document.getElementById('nextEstimate');
 const adviceBtn = document.getElementById('adviceBtn');
 // number of advice boxes to show
 const BOX_COUNT = 10;
+let lastMarketData = null;
+let boxStates = []; // per-box state
 
 function loadScript(url){
   return new Promise((resolve,reject)=>{
@@ -635,12 +701,20 @@ function renderMCGrid(preds, lastPrice){
     d.style.width = '72px'; d.style.height = '42px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
     d.style.fontSize='12px'; d.style.border='1px solid #333'; d.style.borderRadius='6px';
     d.style.color = '#f8f8f2'; d.style.padding = '4px';
-    // if v is an object with advice text and percent, render that
-    if(v && typeof v === 'object' && (v.text || typeof v.percent === 'number')){
-      d.style.background = v.color || (v.percent >= 60 ? '#064' : (v.percent <= 40 ? '#640' : '#333'));
-      const t = document.createElement('div'); t.style.fontSize='12px'; t.style.fontWeight='600'; t.textContent = v.text || '—';
-      const p = document.createElement('div'); p.style.fontSize='11px'; p.style.opacity = '0.95'; p.textContent = (typeof v.percent === 'number') ? `${v.percent}%` : '—';
-      d.appendChild(t); d.appendChild(p);
+    // if v is an object with advice/prediction details, render that
+    if(v && typeof v === 'object'){
+      d.style.background = v.color || (typeof v.percent === 'number' && v.percent >= 60 ? '#064' : (typeof v.percent === 'number' && v.percent <= 40 ? '#640' : '#333'));
+      const top = document.createElement('div'); top.style.fontSize='12px'; top.style.fontWeight='700'; top.textContent = v.pred !== undefined ? `${v.pred}` : (v.text || '—');
+      d.appendChild(top);
+      // TP / SL lines
+      if(typeof v.tp !== 'undefined' || typeof v.sl !== 'undefined'){
+        const tp = document.createElement('div'); tp.style.fontSize='10px'; tp.style.opacity='0.9'; tp.textContent = `TP: ${typeof v.tp==='number'? ('$'+(Math.round(v.tp*100)/100)) : '—'}`;
+        const sl = document.createElement('div'); sl.style.fontSize='10px'; sl.style.opacity='0.9'; sl.textContent = `SL: ${typeof v.sl==='number'? ('$'+(Math.round(v.sl*100)/100)) : '—'}`;
+        d.appendChild(tp); d.appendChild(sl);
+      } else {
+        const p = document.createElement('div'); p.style.fontSize='11px'; p.style.opacity = '0.95'; p.textContent = (typeof v.percent === 'number') ? `${v.percent}%` : '—';
+        d.appendChild(p);
+      }
     }else{
       d.style.background = '#111'; d.style.opacity = 0.5; d.textContent = '—';
     }
@@ -700,6 +774,8 @@ if(predToggleBtn){
 
         const mc = await runMonteCarloPredictions(data.prices, lookback, predictSteps, MC_TRIALS);
         console.log('MC result', mc);
+        // store latest market data for refill operations
+        lastMarketData = data;
         let fund = null;
         let blend = 1.0;
         let adjustedNext = [];
@@ -795,14 +871,27 @@ if(predToggleBtn){
         let basePercent = (mc && typeof mc.avgAccuracy === 'number') ? Math.round(mc.avgAccuracy) : ((mc && typeof mc.percentUp === 'number')? Math.round(mc.percentUp) : 50);
         const adjustedPercent = Math.min(100, Math.max(0, basePercent + profitCount - lossCount));
 
-        // Build advice items: first `trialsUsed` show predictions + adjusted percent; rest are placeholders
+        // Build box states and advice items: each box gets a predicted value, tp, sl
+        boxStates = [];
         const adviceItems = [];
         for(let i=0;i<BOX_COUNT;i++){
           if(i < trialsUsed){
-            const t = perTrialOutcomes[i];
-            const label = `${pos.position || 'Neutral' } ${t.outcome==='profit'? '↑' : (t.outcome==='loss'? '↓' : '–')}`;
-            adviceItems.push({ text: label, percent: adjustedPercent, color: (adjustedPercent>=60? '#064' : (adjustedPercent<=40? '#640' : '#333')) });
+            const p = mc.nextPreds[i];
+            // compute per-box TP/SL based on direction
+            let tp_box = null, sl_box = null;
+            if(p > lastPrice){ // bullish
+              tp_box = p;
+              sl_box = Math.max(0, lastPrice - (p - lastPrice));
+            } else if(p < lastPrice){ // bearish
+              tp_box = p;
+              sl_box = Math.min(1e12, lastPrice + (lastPrice - p));
+            }
+            const label = `${pos.position || 'Neutral' } ${p>lastPrice? '↑' : (p<lastPrice? '↓' : '–')}`;
+            const item = { pred: Math.round(p*100)/100, tp: tp_box, sl: sl_box, percent: adjustedPercent, color: (adjustedPercent>=60? '#064' : (adjustedPercent<=40? '#640' : '#333')) };
+            boxStates.push({ id:i, active:true, predicted:p, tp:tp_box, sl:sl_box, startedAt: Date.now() });
+            adviceItems.push(item);
           }else{
+            boxStates.push({ id:i, active:false });
             adviceItems.push(null);
           }
         }
@@ -824,6 +913,8 @@ if(predToggleBtn){
             console.error('Prediction saved (summary):', rec);
             // start monitoring session for TP/SL
             startSessionMonitor(newRef.key, pos.tp, pos.sl, pos.position);
+            // start per-box monitors
+            startBoxMonitors(newRef.key);
           }catch(e){ console.error('Failed to save MC preds', e); }
         }else{
           // still log summary to console for debugging and start monitor locally
