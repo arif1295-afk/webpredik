@@ -626,17 +626,19 @@ function renderMCGrid(preds, lastPrice){
   if(!mcGridEl) return;
   mcGridEl.innerHTML = '';
   // ensure we display exactly 100 boxes: pad with nulls if needed
-  const show = preds.slice(0,100);
+  const show = Array.isArray(preds) ? preds.slice(0,100) : [];
   while(show.length < 100) show.push(null);
   show.forEach((v,i)=>{
     const d = document.createElement('div');
-    d.style.width = '56px'; d.style.height = '28px'; d.style.display='flex'; d.style.alignItems='center'; d.style.justifyContent='center';
-    d.style.fontSize='11px'; d.style.border='1px solid #333'; d.style.borderRadius='4px';
-    d.style.color = '#f8f8f2';
-    // color by whether predicted value is above/below lastPrice
-    if(typeof v === 'number' && typeof lastPrice === 'number'){
-      if(v > lastPrice) { d.style.background = '#063'; } else if(v < lastPrice) { d.style.background = '#630'; } else { d.style.background = '#333'; }
-      d.textContent = Math.round(v*100)/100;
+    d.style.width = '72px'; d.style.height = '42px'; d.style.display='flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.justifyContent='center';
+    d.style.fontSize='12px'; d.style.border='1px solid #333'; d.style.borderRadius='6px';
+    d.style.color = '#f8f8f2'; d.style.padding = '4px';
+    // if v is an object with advice text and percent, render that
+    if(v && typeof v === 'object' && (v.text || typeof v.percent === 'number')){
+      d.style.background = v.color || (v.percent >= 60 ? '#064' : (v.percent <= 40 ? '#640' : '#333'));
+      const t = document.createElement('div'); t.style.fontSize='12px'; t.style.fontWeight='600'; t.textContent = v.text || '—';
+      const p = document.createElement('div'); p.style.fontSize='11px'; p.style.opacity = '0.95'; p.textContent = (typeof v.percent === 'number') ? `${v.percent}%` : '—';
+      d.appendChild(t); d.appendChild(p);
     }else{
       d.style.background = '#111'; d.style.opacity = 0.5; d.textContent = '—';
     }
@@ -648,16 +650,8 @@ function renderMCGrid(preds, lastPrice){
 // Use the lower indicator canvas for prediction/analysis chart
 let _indicatorChart = null;
 function renderPredictionChart(labels, actualValues, predictedValues){
-  if(!indicatorCtx) return;
-  const data = {
-    labels: labels,
-    datasets: [
-      { label: 'BTC (recent)', data: actualValues, borderColor: '#B8860B', backgroundColor: 'rgba(212,175,55,0.04)', pointRadius: 0, tension:0.15 },
-      { label: 'Predicted (blended)', data: predictedValues, borderColor: '#D4AF37', borderDash:[5,5], backgroundColor: 'rgba(212,175,55,0.06)', pointRadius: 0, tension:0.2 }
-    ]
-  };
-  if(_indicatorChart){ _indicatorChart.data = data; _indicatorChart.update(); return; }
-  _indicatorChart = new Chart(indicatorCtx, { type: 'line', data, options: { responsive:false, maintainAspectRatio:false, scales:{ x:{ display:true }, y:{ display:true } } } });
+  // Charts disabled per user preference — predictions will be shown via the MC grid only.
+  return;
 }
 
 // Helper to remove all predictions in Firebase
@@ -996,3 +990,12 @@ startPricePoll();
 
 // Attach analysis button handlers (manual only)
 // tech/fund buttons removed; analysis now runs inside prediction toggle
+
+// Initialize MC grid with 100 placeholders so layout is stable before predictions
+try{
+  if(mcGridEl){
+    const placeholders = new Array(100).fill(null);
+    renderMCGrid(placeholders, null);
+  }
+  if(nextEstimateEl) nextEstimateEl.textContent = 'Perkiraan berikutnya: —';
+}catch(e){ console.warn('Failed to init MC placeholders', e); }
